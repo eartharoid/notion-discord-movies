@@ -15,6 +15,19 @@ const notion = new NotionClient({ auth: process.env.NOTION_TOKEN });
 const { MovieDb } = require('moviedb-promise');
 const tmdb = new MovieDb(process.env.TMDB_KEY);
 
+const imageToUri = require('image-to-uri');
+
+const fs = require('fs');
+const request = require('request');
+
+const download = (url, path, callback) => {
+	request.head(url, () => {
+		request(url)
+			.pipe(fs.createWriteStream(path))
+			.on('close', callback);
+	});
+};
+
 const {
 	Client: DiscordClient,
 	Intents,
@@ -85,26 +98,57 @@ async function sync() {
 			if (!guild.available) log.warn('The guild is unavailable');
 
 			const year = movie.release_date.split('-')[0];
-			const image = movie.backdrop_path ? 'https://www.themoviedb.org/t/p/w1920_and_h800_multi_faces' + movie.backdrop_path : undefined;
-			log.warn('NOT SETTING IMAGE, NOT SUPPORTED YET', image);
-			const eventData = {
-				channel: process.env.DISCORD_CINEMA_CHANNEL_ID,
-				description: `${movie.adult ? '🔞 **This is an adult movie**\n': ''}${movie.genres.map(g => `\`${g.name}\``).join('  ')}\n${movie.overview}\n\nhttps://www.imdb.com/title/${imdbId}`,
-				entityType: 'VOICE',
-				name: movie.title + ` (${year})`,
-				privacyLevel: 'GUILD_ONLY',
-				reason: 'Synced from Notion',
-				scheduledStartTime: data.timestamp,
-			};
+			const imageUrl = movie.backdrop_path ? 'https://www.themoviedb.org/t/p/w1920_and_h800_multi_faces' + movie.backdrop_path : undefined;
+			const imageFilePath = `./tmp/${imdbId}.jpeg`;
+			log.info(`Downloading cover image for ${movie.title}...`);
 
-			if (stored?.discordId) {
-				log.info(`Editing "${movie.title}" event`);
-				await guild.scheduledEvents.edit(stored.discordId, eventData);
-			} else {
-				const event = await guild.scheduledEvents.create(eventData);
-				log.info(`Creating "${movie.title}" event`);
-				data.discordId = event.id;
-			}
+			download(imageUrl, imageFilePath, async () => {
+				const image = imageToUri(imageFilePath);
+				fs.unlinkSync(imageFilePath);
+				const eventData = {
+					channel_id: process.env.DISCORD_CINEMA_CHANNEL_ID,
+					description: `${movie.adult ? '🔞 **This is an adult movie**\n' : ''}${movie.genres.map(g => `\`${g.name}\``).join('  ')}\n${movie.overview}\n\nhttps://www.imdb.com/title/${imdbId}`,
+					entity_type: 2,
+					image,
+					name: movie.title + ` (${year})`,
+					privacy_level: 2,
+					// reason: 'Synced from Notion',
+					scheduled_end_time: new Date(data.timestamp + (60000 * movie.runtime)).toISOString(),
+					scheduled_start_time: new Date(data.timestamp).toISOString(),
+				};
+
+				const reqOptions = {
+					body: JSON.stringify(eventData),
+					headers: {
+						'Authorization': `Bot ${process.env.DISCORD_TOKEN}`,
+						'Content-Type': 'application/json',
+						'X-Audit-Log-Reason': 'Synced from Notion',
+					},
+				};
+
+				if (stored?.discordId) {
+					log.info(`Editing "${movie.title}" event`);
+					// await guild.scheduledEvents.edit(stored.discordId, eventData);
+					request.patch({
+						url: `https://discord.com/api/guilds/${guild.id}/scheduled-events/${data.discordId}`,
+						...reqOptions,
+					}, err => {
+						if (err) log.error(err);
+					});
+				} else {
+					log.info(`Creating "${movie.title}" event`);
+					// const event = await guild.scheduledEvents.create(eventData);
+					request.post({
+						url: `https://discord.com/api/guilds/${guild.id}/scheduled-events`,
+						...reqOptions,
+					}, (err, res, body) => {
+						if (err) log.error(err);
+						data.discordId = body.id;
+					});
+
+
+				}
+			});
 
 			await keyv.set(result.id, data);
 
