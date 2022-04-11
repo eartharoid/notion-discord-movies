@@ -35,6 +35,7 @@ const {
 const discord = new DiscordClient({
 	intents: [
 		Intents.FLAGS.GUILDS,
+		Intents.FLAGS.GUILD_INVITES,
 		Intents.FLAGS.GUILD_SCHEDULED_EVENTS,
 	],
 	presence: {
@@ -91,67 +92,91 @@ async function sync() {
 				stored.imdbUrl === data.imdbUrl
 			) continue; // skip if exists & unchanged
 
-			const movie = await tmdb.movieInfo(imdbId);
+			const channel = discord.channels.cache.get(process.env.DISCORD_NOTIFICATIONS_CHANNEL_ID);
+			tmdb.movieInfo(imdbId)
+				.then(async movie => {
+					if (movie.success === false) {
+						log.warn(`Movie with IMDb ID "${imdbId}" not found in TMDB`);
+						return channel.send(`<t:${data.timestamp / 1000}:F> https://www.imdb.com/title/${imdbId}`);
+					}
 
-			const guild = discord.guilds.cache.get(process.env.DISCORD_SERVER_ID);
-			if (!guild) log.warn('The bot is not in the Discord server');
-			if (!guild.available) log.warn('The guild is unavailable');
+					const guild = discord.guilds.cache.get(process.env.DISCORD_SERVER_ID);
+					if (!guild) log.warn('The bot is not in the Discord server');
+					if (!guild.available) log.warn('The guild is unavailable');
 
-			const year = movie.release_date.split('-')[0];
-			const imageUrl = movie.backdrop_path ? 'https://www.themoviedb.org/t/p/w1920_and_h800_multi_faces' + movie.backdrop_path : undefined;
-			const imageFilePath = `./tmp/${imdbId}.jpeg`;
-			log.info(`Downloading cover image for ${movie.title}...`);
+					const year = movie.release_date.split('-')[0];
+					const imageUrl = movie.backdrop_path ? 'https://www.themoviedb.org/t/p/w1920_and_h800_multi_faces' + movie.backdrop_path : undefined;
+					const imageFilePath = `./tmp/${imdbId}.jpeg`;
+					log.info(`Downloading cover image for ${movie.title}...`);
 
-			download(imageUrl, imageFilePath, async () => {
-				const image = imageToUri(imageFilePath);
-				fs.unlinkSync(imageFilePath);
-				const eventData = {
-					channel_id: process.env.DISCORD_CINEMA_CHANNEL_ID,
-					description: `${movie.adult ? '🔞 **This is an adult movie**\n' : ''}${movie.genres.map(g => `\`${g.name}\``).join('  ')}\n${movie.overview}\n\nhttps://www.imdb.com/title/${imdbId}`,
-					entity_type: 2,
-					image,
-					name: movie.title + ` (${year})`,
-					privacy_level: 2,
-					// reason: 'Synced from Notion',
-					scheduled_end_time: new Date(data.timestamp + (60000 * movie.runtime)).toISOString(),
-					scheduled_start_time: new Date(data.timestamp).toISOString(),
-				};
+					download(imageUrl, imageFilePath, async () => {
+						const image = imageToUri(imageFilePath);
+						fs.unlinkSync(imageFilePath);
+						const eventData = {
+							channel_id: process.env.DISCORD_CINEMA_CHANNEL_ID,
+							description: `${movie.adult ? '🔞 **This is an adult movie**\n' : ''}${movie.genres.map(g => `\`${g.name}\``).join('  ')}\n${movie.overview}\n\nhttps://www.imdb.com/title/${imdbId}`,
+							entity_type: 2,
+							image,
+							name: movie.title + ` (${year})`,
+							privacy_level: 2,
+							// reason: 'Synced from Notion',
+							scheduled_end_time: new Date(data.timestamp + (60000 * movie.runtime)).toISOString(),
+							scheduled_start_time: new Date(data.timestamp).toISOString(),
+						};
 
-				const reqOptions = {
-					body: JSON.stringify(eventData),
-					headers: {
-						'Authorization': `Bot ${process.env.DISCORD_TOKEN}`,
-						'Content-Type': 'application/json',
-						'X-Audit-Log-Reason': 'Synced from Notion',
-					},
-				};
+						const reqOptions = {
+							body: JSON.stringify(eventData),
+							headers: {
+								'Authorization': `Bot ${process.env.DISCORD_TOKEN}`,
+								'Content-Type': 'application/json',
+								'X-Audit-Log-Reason': 'Synced from Notion',
+							},
+						};
 
-				if (stored?.discordId) {
-					log.info(`Editing "${movie.title}" event`);
-					// await guild.scheduledEvents.edit(stored.discordId, eventData);
-					request.patch({
-						url: `https://discord.com/api/guilds/${guild.id}/scheduled-events/${data.discordId}`,
-						...reqOptions,
-					}, err => {
-						if (err) log.error(err);
+						if (stored?.discordId) {
+							log.info(`Editing "${movie.title}" event`);
+							// await guild.scheduledEvents.edit(stored.discordId, eventData);
+							request.patch({
+								url: `https://discord.com/api/guilds/${guild.id}/scheduled-events/${data.discordId}`,
+								...reqOptions,
+							}, async err => {
+								if (err) log.error(err);
+								await keyv.set(result.id, data);
+							});
+						} else {
+							log.info(`Creating "${movie.title}" event`);
+							// const event = await guild.scheduledEvents.create(eventData);
+							request.post({
+								url: `https://discord.com/api/guilds/${guild.id}/scheduled-events`,
+								...reqOptions,
+							}, async (err, res, body) => {
+								if (err) log.error(err);
+
+								body = JSON.parse(body);
+								data.discordId = body.id;
+								await keyv.set(result.id, data);
+
+								const event = await guild.scheduledEvents.fetch(data.discordId);
+								const invite = await event.createInviteURL();
+
+								const genreRoleIds = movie.genres
+									.map(g => guild.roles.cache.find(role => role.name.toLowerCase().includes(g.name.toLowerCase()))?.id)
+									.filter(id => id !== undefined);
+
+								const message = `${genreRoleIds.map(id => `<@&${id}>`).join(' ')}\n${invite}\n**Click the \`Interested\` button to receive a notification when the movie starts.**`;
+								channel.send(message);
+							});
+
+						}
 					});
-				} else {
-					log.info(`Creating "${movie.title}" event`);
-					// const event = await guild.scheduledEvents.create(eventData);
-					request.post({
-						url: `https://discord.com/api/guilds/${guild.id}/scheduled-events`,
-						...reqOptions,
-					}, (err, res, body) => {
-						if (err) log.error(err);
-						data.discordId = body.id;
-					});
 
 
-				}
-			});
-
-			await keyv.set(result.id, data);
-
+				})
+				.catch(async error => {
+					log.error(error.message);
+					await keyv.set(result.id, data);
+					return channel.send(`<t:${data.timestamp / 1000}:F> https://www.imdb.com/title/${imdbId}`);
+				});
 		}
 	} catch (error) {
 		log.error(error);
