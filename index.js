@@ -157,13 +157,13 @@ async function sync() {
 								await keyv.set(result.id, data);
 
 								const event = await guild.scheduledEvents.fetch(data.discordId);
-								const invite = await event.createInviteURL();
+								// const invite = await event.createInviteURL();
 
 								const genreRoleIds = movie.genres
 									.map(g => guild.roles.cache.find(role => role.name.toLowerCase().includes(g.name.toLowerCase()))?.id)
 									.filter(id => id !== undefined);
 
-								const message = `${genreRoleIds.map(id => `<@&${id}>`).join(' ')}\n${invite}\n**Click the \`Interested\` button to receive a notification when the movie starts.**`;
+								const message = `${genreRoleIds.map(id => `<@&${id}>`).join(' ')}\n${event.url}\n**Click the \`Interested\` button to receive a notification when the movie starts.**`;
 								channel.send(message);
 							});
 
